@@ -6,10 +6,19 @@
 (define-constant ERR_ALREADY_REGISTERED (err u104))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u105))
 
+
+(define-constant ERR_NAME_EXPIRED (err u106))
+(define-constant ERR_PARENT_NOT_FOUND (err u107))
+(define-constant ERR_SUBDOMAIN_NOT_FOUND (err u108))
+(define-constant ERR_INVALID_SUBDOMAIN (err u109))
+
 (define-data-var registration-fee uint u1000000)
+(define-data-var renewal-fee uint u500000)
+(define-data-var registration-period uint u52560)
 (define-data-var total-registrations uint u0)
 
-(define-map name-to-address { name: (string-ascii 50) } { owner: principal, registered-at: uint })
+
+(define-map name-to-address { name: (string-ascii 50) } { owner: principal, registered-at: uint, expires-at: uint })
 (define-map address-to-name { owner: principal } { name: (string-ascii 50) })
 (define-map name-metadata { name: (string-ascii 50) } { description: (string-ascii 200), website: (string-ascii 100) })
 
@@ -18,17 +27,24 @@
     (name-length (len name))
     (existing-name (map-get? name-to-address { name: name }))
     (existing-address (map-get? address-to-name { owner: tx-sender }))
+    (current-height stacks-block-height)
+    (expiry-height (+ current-height (var-get registration-period)))
   )
     (asserts! (> name-length u0) ERR_INVALID_NAME)
     (asserts! (<= name-length u50) ERR_INVALID_NAME)
-    (asserts! (is-none existing-name) ERR_NAME_TAKEN)
+    (asserts! (is-name-available-or-expired name) ERR_NAME_TAKEN)
     (asserts! (is-none existing-address) ERR_ALREADY_REGISTERED)
     
     (try! (stx-transfer? (var-get registration-fee) tx-sender CONTRACT_OWNER))
     
+    (if (is-some existing-name)
+      (let ((old-owner (get owner (unwrap-panic existing-name))))
+        (map-delete address-to-name { owner: old-owner }))
+      true)
+    
     (map-set name-to-address 
       { name: name } 
-      { owner: tx-sender, registered-at: stacks-block-height })
+      { owner: tx-sender, registered-at: current-height, expires-at: expiry-height })
     (map-set address-to-name 
       { owner: tx-sender } 
       { name: name })
@@ -38,18 +54,59 @@
   )
 )
 
+(define-public (renew-name (name (string-ascii 50)))
+  (let (
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (current-owner (get owner name-info))
+    (current-expiry (get expires-at name-info))
+    (new-expiry (+ current-expiry (var-get registration-period)))
+  )
+    (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    
+    (try! (stx-transfer? (var-get renewal-fee) tx-sender CONTRACT_OWNER))
+    
+    (map-set name-to-address 
+      { name: name } 
+      { owner: current-owner, 
+        registered-at: (get registered-at name-info), 
+        expires-at: new-expiry })
+    
+    (ok new-expiry)
+  )
+)
+
+(define-public (set-renewal-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set renewal-fee new-fee)
+    (ok true)
+  )
+)
+
+(define-public (set-registration-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set registration-period new-period)
+    (ok true)
+  )
+)
+
 (define-public (transfer-name (name (string-ascii 50)) (new-owner principal))
   (let (
     (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
     (current-owner (get owner name-info))
+    (expiry-height (get expires-at name-info))
   )
     (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
     (asserts! (is-none (map-get? address-to-name { owner: new-owner })) ERR_ALREADY_REGISTERED)
     
     (map-delete address-to-name { owner: current-owner })
     (map-set name-to-address 
       { name: name } 
-      { owner: new-owner, registered-at: (get registered-at name-info) })
+      { owner: new-owner, 
+        registered-at: (get registered-at name-info),
+        expires-at: expiry-height })
     (map-set address-to-name 
       { owner: new-owner } 
       { name: name })
@@ -62,8 +119,10 @@
   (let (
     (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
     (current-owner (get owner name-info))
+    (expiry-height (get expires-at name-info))
   )
     (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
     
     (map-set name-metadata 
       { name: name } 
@@ -99,7 +158,10 @@
 
 (define-read-only (get-name-owner (name (string-ascii 50)))
   (match (map-get? name-to-address { name: name })
-    name-info (ok (get owner name-info))
+    name-info 
+      (if (> (get expires-at name-info) stacks-block-height)
+        (ok (get owner name-info))
+        ERR_NAME_EXPIRED)
     ERR_NAME_NOT_FOUND
   )
 )
@@ -129,12 +191,34 @@
   (ok (var-get registration-fee))
 )
 
+(define-read-only (get-renewal-fee)
+  (ok (var-get renewal-fee))
+)
+
+(define-read-only (get-registration-period)
+  (ok (var-get registration-period))
+)
+
 (define-read-only (get-total-registrations)
   (ok (var-get total-registrations))
 )
 
 (define-read-only (is-name-available (name (string-ascii 50)))
   (is-none (map-get? name-to-address { name: name }))
+)
+
+(define-read-only (is-name-expired (name (string-ascii 50)))
+  (match (map-get? name-to-address { name: name })
+    name-info (<= (get expires-at name-info) stacks-block-height)
+    false
+  )
+)
+
+(define-read-only (is-name-available-or-expired (name (string-ascii 50)))
+  (match (map-get? name-to-address { name: name })
+    name-info (<= (get expires-at name-info) stacks-block-height)
+    true
+  )
 )
 
 (define-read-only (get-contract-owner)
