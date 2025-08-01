@@ -11,6 +11,8 @@
 (define-constant ERR_PARENT_NOT_FOUND (err u107))
 (define-constant ERR_SUBDOMAIN_NOT_FOUND (err u108))
 (define-constant ERR_INVALID_SUBDOMAIN (err u109))
+(define-constant ERR_NO_REDIRECT_SET (err u110))
+(define-constant ERR_INVALID_REDIRECT_TYPE (err u111))
 
 (define-data-var registration-fee uint u1000000)
 (define-data-var renewal-fee uint u500000)
@@ -21,6 +23,7 @@
 (define-map name-to-address { name: (string-ascii 50) } { owner: principal, registered-at: uint, expires-at: uint })
 (define-map address-to-name { owner: principal } { name: (string-ascii 50) })
 (define-map name-metadata { name: (string-ascii 50) } { description: (string-ascii 200), website: (string-ascii 100) })
+(define-map name-redirects { name: (string-ascii 50) } { redirect-type: (string-ascii 20), target: (string-ascii 200) })
 
 (define-public (register-name (name (string-ascii 50)))
   (let (
@@ -150,6 +153,7 @@
     (map-delete name-to-address { name: name })
     (map-delete address-to-name { owner: current-owner })
     (map-delete name-metadata { name: name })
+    (map-delete name-redirects { name: name })
     
     (var-set total-registrations (- (var-get total-registrations) u1))
     (ok true)
@@ -234,4 +238,62 @@
       (<= name-length u50)
     )
   )
+)
+
+(define-public (set-redirect (name (string-ascii 50)) (redirect-type (string-ascii 20)) (target (string-ascii 200)))
+  (let (
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (current-owner (get owner name-info))
+    (expiry-height (get expires-at name-info))
+  )
+    (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
+    (asserts! (or (is-eq redirect-type "url") (is-eq redirect-type "stacks") (is-eq redirect-type "bitcoin")) ERR_INVALID_REDIRECT_TYPE)
+    (asserts! (> (len target) u0) ERR_INVALID_REDIRECT_TYPE)
+    
+    (map-set name-redirects 
+      { name: name } 
+      { redirect-type: redirect-type, target: target })
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-redirect (name (string-ascii 50)))
+  (let (
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (current-owner (get owner name-info))
+    (expiry-height (get expires-at name-info))
+  )
+    (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
+    (asserts! (is-some (map-get? name-redirects { name: name })) ERR_NO_REDIRECT_SET)
+    
+    (map-delete name-redirects { name: name })
+    (ok true)
+  )
+)
+
+(define-read-only (resolve-name (name (string-ascii 50)))
+  (let (
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (expiry-height (get expires-at name-info))
+  )
+    (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
+    (match (map-get? name-redirects { name: name })
+      redirect-info (ok redirect-info)
+      ERR_NO_REDIRECT_SET
+    )
+  )
+)
+
+(define-read-only (get-redirect (name (string-ascii 50)))
+  (match (map-get? name-redirects { name: name })
+    redirect-info (ok redirect-info)
+    ERR_NO_REDIRECT_SET
+  )
+)
+
+(define-read-only (has-redirect (name (string-ascii 50)))
+  (is-some (map-get? name-redirects { name: name }))
 )
