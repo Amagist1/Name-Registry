@@ -13,10 +13,13 @@
 (define-constant ERR_INVALID_SUBDOMAIN (err u109))
 (define-constant ERR_NO_REDIRECT_SET (err u110))
 (define-constant ERR_INVALID_REDIRECT_TYPE (err u111))
+(define-constant ERR_IN_GRACE_PERIOD (err u112))
+(define-constant ERR_GRACE_PERIOD_EXPIRED (err u113))
 
 (define-data-var registration-fee uint u1000000)
 (define-data-var renewal-fee uint u500000)
 (define-data-var registration-period uint u52560)
+(define-data-var grace-period uint u2160)
 (define-data-var total-registrations uint u0)
 
 
@@ -220,7 +223,8 @@
 
 (define-read-only (is-name-available-or-expired (name (string-ascii 50)))
   (match (map-get? name-to-address { name: name })
-    name-info (<= (get expires-at name-info) stacks-block-height)
+    name-info (let ((grace-end (+ (get expires-at name-info) (var-get grace-period))))
+                (<= grace-end stacks-block-height))
     true
   )
 )
@@ -296,4 +300,58 @@
 
 (define-read-only (has-redirect (name (string-ascii 50)))
   (is-some (map-get? name-redirects { name: name }))
+)
+
+(define-public (recover-from-grace-period (name (string-ascii 50)))
+  (let (
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (current-owner (get owner name-info))
+    (expiry-height (get expires-at name-info))
+    (grace-end (+ expiry-height (var-get grace-period)))
+    (current-height stacks-block-height)
+    (new-expiry (+ current-height (var-get registration-period)))
+  )
+    (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    (asserts! (<= expiry-height current-height) ERR_NAME_EXPIRED)
+    (asserts! (> grace-end current-height) ERR_GRACE_PERIOD_EXPIRED)
+    
+    (try! (stx-transfer? (var-get renewal-fee) tx-sender CONTRACT_OWNER))
+    
+    (map-set name-to-address 
+      { name: name } 
+      { owner: current-owner, 
+        registered-at: (get registered-at name-info), 
+        expires-at: new-expiry })
+    
+    (ok new-expiry)
+  )
+)
+
+(define-public (set-grace-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set grace-period new-period)
+    (ok true)
+  )
+)
+
+(define-read-only (is-in-grace-period (name (string-ascii 50)))
+  (match (map-get? name-to-address { name: name })
+    name-info (let ((expiry (get expires-at name-info))
+                    (grace-end (+ expiry (var-get grace-period))))
+                (and (<= expiry stacks-block-height) 
+                     (> grace-end stacks-block-height)))
+    false
+  )
+)
+
+(define-read-only (get-grace-period-end (name (string-ascii 50)))
+  (match (map-get? name-to-address { name: name })
+    name-info (ok (+ (get expires-at name-info) (var-get grace-period)))
+    ERR_NAME_NOT_FOUND
+  )
+)
+
+(define-read-only (get-grace-period)
+  (ok (var-get grace-period))
 )
