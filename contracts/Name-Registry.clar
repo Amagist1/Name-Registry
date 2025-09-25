@@ -15,6 +15,7 @@
 (define-constant ERR_INVALID_REDIRECT_TYPE (err u111))
 (define-constant ERR_IN_GRACE_PERIOD (err u112))
 (define-constant ERR_GRACE_PERIOD_EXPIRED (err u113))
+(define-constant ERR_HISTORY_NOT_FOUND (err u114))
 
 (define-data-var registration-fee uint u1000000)
 (define-data-var renewal-fee uint u500000)
@@ -27,6 +28,8 @@
 (define-map address-to-name { owner: principal } { name: (string-ascii 50) })
 (define-map name-metadata { name: (string-ascii 50) } { description: (string-ascii 200), website: (string-ascii 100) })
 (define-map name-redirects { name: (string-ascii 50) } { redirect-type: (string-ascii 20), target: (string-ascii 200) })
+(define-map name-history-count { name: (string-ascii 50) } { count: uint })
+(define-map name-history { name: (string-ascii 50), index: uint } { event-type: (string-ascii 20), from-owner: (optional principal), to-owner: principal, block-height: uint })
 
 (define-public (register-name (name (string-ascii 50)))
   (let (
@@ -56,6 +59,7 @@
       { name: name })
     
     (var-set total-registrations (+ (var-get total-registrations) u1))
+    (unwrap-panic (record-name-event name "registration" none tx-sender))
     (ok name)
   )
 )
@@ -117,6 +121,7 @@
       { owner: new-owner } 
       { name: name })
     
+    (unwrap-panic (record-name-event name "transfer" (some current-owner) new-owner))
     (ok true)
   )
 )
@@ -157,6 +162,7 @@
     (map-delete address-to-name { owner: current-owner })
     (map-delete name-metadata { name: name })
     (map-delete name-redirects { name: name })
+    (map-delete name-history-count { name: name })
     
     (var-set total-registrations (- (var-get total-registrations) u1))
     (ok true)
@@ -323,6 +329,7 @@
         registered-at: (get registered-at name-info), 
         expires-at: new-expiry })
     
+    (unwrap-panic (record-name-event name "recovery" none current-owner))
     (ok new-expiry)
   )
 )
@@ -354,4 +361,59 @@
 
 (define-read-only (get-grace-period)
   (ok (var-get grace-period))
+)
+
+(define-private (record-name-event (name (string-ascii 50)) (event-type (string-ascii 20)) (from-owner (optional principal)) (to-owner principal))
+  (let (
+    (current-count (default-to u0 (get count (map-get? name-history-count { name: name }))))
+    (new-count (+ current-count u1))
+  )
+    (map-set name-history-count 
+      { name: name } 
+      { count: new-count })
+    
+    (map-set name-history 
+      { name: name, index: new-count } 
+      { event-type: event-type, from-owner: from-owner, to-owner: to-owner, block-height: stacks-block-height })
+    
+    (ok new-count)
+  )
+)
+
+(define-read-only (get-name-history-count (name (string-ascii 50)))
+  (ok (default-to u0 (get count (map-get? name-history-count { name: name }))))
+)
+
+(define-read-only (get-name-history-event (name (string-ascii 50)) (index uint))
+  (match (map-get? name-history { name: name, index: index })
+    history-event (ok history-event)
+    ERR_HISTORY_NOT_FOUND
+  )
+)
+
+(define-read-only (get-name-recent-events (name (string-ascii 50)) (limit uint))
+  (let (
+    (total-count (default-to u0 (get count (map-get? name-history-count { name: name }))))
+    (start-index (if (> total-count limit) (- total-count (- limit u1)) u1))
+  )
+    (if (is-eq total-count u0)
+      (ok none)
+      (ok (some { start-index: start-index, total-count: total-count }))
+    )
+  )
+)
+
+(define-read-only (get-name-first-registration (name (string-ascii 50)))
+  (get-name-history-event name u1)
+)
+
+(define-read-only (get-name-latest-event (name (string-ascii 50)))
+  (let (
+    (total-count (default-to u0 (get count (map-get? name-history-count { name: name }))))
+  )
+    (if (is-eq total-count u0)
+      ERR_HISTORY_NOT_FOUND
+      (get-name-history-event name total-count)
+    )
+  )
 )
