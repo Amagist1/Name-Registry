@@ -16,6 +16,10 @@
 (define-constant ERR_IN_GRACE_PERIOD (err u112))
 (define-constant ERR_GRACE_PERIOD_EXPIRED (err u113))
 (define-constant ERR_HISTORY_NOT_FOUND (err u114))
+(define-constant ERR_LEASE_NOT_FOUND (err u115))
+(define-constant ERR_LEASE_EXPIRED (err u116))
+(define-constant ERR_ALREADY_LEASED (err u117))
+(define-constant ERR_NOT_LESSEE (err u118))
 
 (define-data-var registration-fee uint u1000000)
 (define-data-var renewal-fee uint u500000)
@@ -30,6 +34,7 @@
 (define-map name-redirects { name: (string-ascii 50) } { redirect-type: (string-ascii 20), target: (string-ascii 200) })
 (define-map name-history-count { name: (string-ascii 50) } { count: uint })
 (define-map name-history { name: (string-ascii 50), index: uint } { event-type: (string-ascii 20), from-owner: (optional principal), to-owner: principal, block-height: uint })
+(define-map name-leases { name: (string-ascii 50) } { lessee: principal, lease-end: uint, lease-price: uint, leased-at: uint })
 
 (define-public (register-name (name (string-ascii 50)))
   (let (
@@ -132,7 +137,7 @@
     (current-owner (get owner name-info))
     (expiry-height (get expires-at name-info))
   )
-    (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq tx-sender current-owner) (is-active-lessee tx-sender name)) ERR_UNAUTHORIZED)
     (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
     
     (map-set name-metadata 
@@ -163,6 +168,7 @@
     (map-delete name-metadata { name: name })
     (map-delete name-redirects { name: name })
     (map-delete name-history-count { name: name })
+    (map-delete name-leases { name: name })
     
     (var-set total-registrations (- (var-get total-registrations) u1))
     (ok true)
@@ -256,7 +262,7 @@
     (current-owner (get owner name-info))
     (expiry-height (get expires-at name-info))
   )
-    (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq tx-sender current-owner) (is-active-lessee tx-sender name)) ERR_UNAUTHORIZED)
     (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
     (asserts! (or (is-eq redirect-type "url") (is-eq redirect-type "stacks") (is-eq redirect-type "bitcoin")) ERR_INVALID_REDIRECT_TYPE)
     (asserts! (> (len target) u0) ERR_INVALID_REDIRECT_TYPE)
@@ -415,5 +421,105 @@
       ERR_HISTORY_NOT_FOUND
       (get-name-history-event name total-count)
     )
+  )
+)
+
+(define-private (is-active-lessee (user principal) (name (string-ascii 50)))
+  (match (map-get? name-leases { name: name })
+    lease-info (and (is-eq user (get lessee lease-info)) 
+                    (> (get lease-end lease-info) stacks-block-height))
+    false
+  )
+)
+
+(define-public (lease-name (name (string-ascii 50)) (lessee principal) (duration uint) (price uint))
+  (let (
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (current-owner (get owner name-info))
+    (expiry-height (get expires-at name-info))
+    (lease-end (+ stacks-block-height duration))
+    (existing-lease (map-get? name-leases { name: name }))
+  )
+    (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
+    (asserts! (< lease-end expiry-height) ERR_NAME_EXPIRED)
+    (asserts! (> price u0) ERR_INSUFFICIENT_PAYMENT)
+    (asserts! (> duration u0) ERR_INVALID_NAME)
+    (asserts! (match existing-lease 
+                lease-data (<= (get lease-end lease-data) stacks-block-height)
+                true) ERR_ALREADY_LEASED)
+    
+    (try! (stx-transfer? price lessee current-owner))
+    
+    (map-set name-leases 
+      { name: name } 
+      { lessee: lessee, lease-end: lease-end, lease-price: price, leased-at: stacks-block-height })
+    
+    (unwrap-panic (record-name-event name "lease" none lessee))
+    (ok lease-end)
+  )
+)
+
+(define-public (terminate-lease (name (string-ascii 50)))
+  (let (
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (current-owner (get owner name-info))
+    (lease-info (unwrap! (map-get? name-leases { name: name }) ERR_LEASE_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    
+    (map-delete name-leases { name: name })
+    (ok true)
+  )
+)
+
+(define-public (extend-lease (name (string-ascii 50)) (additional-duration uint) (additional-price uint))
+  (let (
+    (lease-info (unwrap! (map-get? name-leases { name: name }) ERR_LEASE_NOT_FOUND))
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (current-owner (get owner name-info))
+    (current-lessee (get lessee lease-info))
+    (current-lease-end (get lease-end lease-info))
+    (new-lease-end (+ current-lease-end additional-duration))
+    (expiry-height (get expires-at name-info))
+  )
+    (asserts! (is-eq tx-sender current-lessee) ERR_NOT_LESSEE)
+    (asserts! (> current-lease-end stacks-block-height) ERR_LEASE_EXPIRED)
+    (asserts! (< new-lease-end expiry-height) ERR_NAME_EXPIRED)
+    (asserts! (> additional-price u0) ERR_INSUFFICIENT_PAYMENT)
+    
+    (try! (stx-transfer? additional-price tx-sender current-owner))
+    
+    (map-set name-leases 
+      { name: name } 
+      { lessee: current-lessee, 
+        lease-end: new-lease-end, 
+        lease-price: (+ (get lease-price lease-info) additional-price),
+        leased-at: (get leased-at lease-info) })
+    
+    (ok new-lease-end)
+  )
+)
+
+(define-read-only (get-lease-info (name (string-ascii 50)))
+  (match (map-get? name-leases { name: name })
+    lease-info (ok lease-info)
+    ERR_LEASE_NOT_FOUND
+  )
+)
+
+(define-read-only (is-name-leased (name (string-ascii 50)))
+  (match (map-get? name-leases { name: name })
+    lease-info (> (get lease-end lease-info) stacks-block-height)
+    false
+  )
+)
+
+(define-read-only (get-lessee (name (string-ascii 50)))
+  (match (map-get? name-leases { name: name })
+    lease-info (if (> (get lease-end lease-info) stacks-block-height)
+                  (ok (get lessee lease-info))
+                  ERR_LEASE_EXPIRED)
+    ERR_LEASE_NOT_FOUND
   )
 )
