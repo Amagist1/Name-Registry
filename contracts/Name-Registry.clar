@@ -21,6 +21,10 @@
 (define-constant ERR_ALREADY_LEASED (err u117))
 (define-constant ERR_NOT_LESSEE (err u118))
 
+(define-constant ERR_RECORD_NOT_FOUND (err u119))
+(define-constant ERR_INVALID_RECORD_KEY (err u120))
+(define-constant ERR_INVALID_RECORD_VALUE (err u121))
+
 (define-data-var registration-fee uint u1000000)
 (define-data-var renewal-fee uint u500000)
 (define-data-var registration-period uint u52560)
@@ -35,6 +39,8 @@
 (define-map name-history-count { name: (string-ascii 50) } { count: uint })
 (define-map name-history { name: (string-ascii 50), index: uint } { event-type: (string-ascii 20), from-owner: (optional principal), to-owner: principal, block-height: uint })
 (define-map name-leases { name: (string-ascii 50) } { lessee: principal, lease-end: uint, lease-price: uint, leased-at: uint })
+
+(define-map name-records { name: (string-ascii 50), key: (string-ascii 40) } { value: (string-ascii 200) })
 
 (define-public (register-name (name (string-ascii 50)))
   (let (
@@ -522,4 +528,47 @@
                   ERR_LEASE_EXPIRED)
     ERR_LEASE_NOT_FOUND
   )
+)
+
+(define-public (set-record (name (string-ascii 50)) (key (string-ascii 40)) (value (string-ascii 200)))
+  (let (
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (current-owner (get owner name-info))
+    (expiry-height (get expires-at name-info))
+    (key-length (len key))
+    (value-length (len value))
+  )
+    (asserts! (or (is-eq tx-sender current-owner) (is-active-lessee tx-sender name)) ERR_UNAUTHORIZED)
+    (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
+    (asserts! (> key-length u0) ERR_INVALID_RECORD_KEY)
+    (asserts! (> value-length u0) ERR_INVALID_RECORD_VALUE)
+    (map-set name-records { name: name, key: key } { value: value })
+    (ok true)
+  )
+)
+
+(define-public (remove-record (name (string-ascii 50)) (key (string-ascii 40)))
+  (let (
+    (name-info (unwrap! (map-get? name-to-address { name: name }) ERR_NAME_NOT_FOUND))
+    (current-owner (get owner name-info))
+    (expiry-height (get expires-at name-info))
+    (existing (map-get? name-records { name: name, key: key }))
+  )
+    (asserts! (is-eq tx-sender current-owner) ERR_UNAUTHORIZED)
+    (asserts! (> expiry-height stacks-block-height) ERR_NAME_EXPIRED)
+    (asserts! (is-some existing) ERR_RECORD_NOT_FOUND)
+    (map-delete name-records { name: name, key: key })
+    (ok true)
+  )
+)
+
+(define-read-only (get-record (name (string-ascii 50)) (key (string-ascii 40)))
+  (match (map-get? name-records { name: name, key: key })
+    record-info (ok (get value record-info))
+    ERR_RECORD_NOT_FOUND
+  )
+)
+
+(define-read-only (has-record (name (string-ascii 50)) (key (string-ascii 40)))
+  (is-some (map-get? name-records { name: name, key: key }))
 )
